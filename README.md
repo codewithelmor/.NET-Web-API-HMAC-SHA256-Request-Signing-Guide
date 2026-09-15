@@ -1,153 +1,361 @@
-# .NET Web API — HMAC-SHA256 Request Signing Guide
+# .NET Web API — HMAC-SHA256 Request Signing (Clean Architecture Edition)
 
-A complete, production-oriented guide to signing and verifying HTTP requests with HMAC-SHA256 in ASP.NET Core (.NET 8), covering both **inbound verification** (your API validates signed requests from clients) and **outbound signing** (your API calls another service and signs its own requests).
+This is the Clean Architecture refactor of the HMAC signing guide. Same cryptographic guarantees (authenticity, integrity, replay protection, timing-safe comparison) — but the code is now split by **dependency direction**: `Domain` → `Application` → `Infrastructure`/`Api`, with `Api` and `Infrastructure` depending on `Application`, never the other way around.
 
 ---
 
 ## Table of Contents
 
-1. [Concepts & Threat Model](#1-concepts--threat-model)
-2. [Canonical String Construction](#2-canonical-string-construction)
-3. [Shared Project: Signature Utility](#3-shared-project-signature-utility)
-4. [Inbound: Verifying Signed Requests (Middleware + Auth Handler)](#4-inbound-verifying-signed-requests)
-5. [Outbound: Signing Requests with `HttpClient`](#5-outbound-signing-requests-with-httpclient)
-6. [Replay Protection](#6-replay-protection)
-7. [Full Working Example](#7-full-working-example)
-8. [Testing with curl](#8-testing-with-curl)
-9. [Security Checklist](#9-security-checklist)
+1. [Layering Rules & Where Everything Lives](#1-layering-rules--where-everything-lives)
+2. [Solution / Folder Structure](#2-solution--folder-structure)
+3. [Project References](#3-project-references)
+4. [Domain Layer](#4-domain-layer)
+5. [Application Layer — Interfaces & Models](#5-application-layer--interfaces--models)
+6. [Infrastructure Layer — Crypto, Secrets, Nonce Storage](#6-infrastructure-layer--crypto-secrets-nonce-storage)
+7. [Infrastructure Layer — Outbound Signing (`HttpClient`)](#7-infrastructure-layer--outbound-signing-httpclient)
+8. [Api Layer — Inbound Verification (Middleware + Auth Handler)](#8-api-layer--inbound-verification-middleware--auth-handler)
+9. [Api Layer — Controllers & Program.cs (DI Wiring)](#9-api-layer--controllers--programcs-di-wiring)
+10. [Testing Strategy by Layer](#10-testing-strategy-by-layer)
+11. [Security Checklist](#11-security-checklist)
 
 ---
 
-## 1. Concepts & Threat Model
+## 1. Layering Rules & Where Everything Lives
 
-HMAC-SHA256 request signing proves two things to a server:
+The core question for every class: **"Does this know about HTTP/ASP.NET Core, or is it pure logic?"**
 
-- **Authenticity** — the caller knows the shared secret.
-- **Integrity** — the request (method, path, query, body, timestamp) wasn't modified in transit.
+| Concern | Layer | Why |
+|---|---|---|
+| Canonical string format, signing algorithm contract, verification result, domain exceptions | **Application** (interfaces + models only) | Business rule: "a request is valid if X" — has no idea what `HttpContext` is |
+| Actual HMAC-SHA256 computation (`System.Security.Cryptography`) | **Infrastructure** | A cryptographic *implementation detail* behind `ISignatureService` |
+| Where secrets come from (config, Key Vault, env vars) | **Infrastructure** | Implementation detail behind `ISecretProvider` |
+| Where nonces are stored (memory cache, Redis) | **Infrastructure** | Implementation detail behind `INonceStore` |
+| `DelegatingHandler` that signs outgoing `HttpClient` calls | **Infrastructure** | `HttpClient`/`HttpRequestMessage` are infrastructure concerns (framework/BCL plumbing), but it *uses* `ISignatureService` from Application |
+| Middleware / `AuthenticationHandler` that reads `HttpContext`, extracts headers, and calls into Application services | **Api** | `HttpContext` is a presentation-layer/framework concept — this is the "adapter" that translates HTTP into calls against the Application contracts |
+| DI wiring, `appsettings.json` binding, pipeline order | **Api** (`Program.cs`) | Composition root — the only place allowed to know about every layer at once |
 
-It does **not** provide confidentiality — always pair with HTTPS/TLS. It's commonly used for:
+**Dependency rule:** `Api` → `Infrastructure` → `Application` → `Domain`. Arrows point *inward*. `Application` never references `Infrastructure` or `Api`. `Infrastructure` implements `Application` interfaces but is otherwise invisible to `Domain`.
 
-- Server-to-server (S2S) webhooks (Stripe, GitHub, Shopify all use variants of this)
-- Internal microservice-to-microservice auth
-- Partner/API-key style integrations where you don't want to pass the secret itself on the wire
-
-**Standard signing recipe:**
-
-```
-signature = Base64( HMAC-SHA256( secret, canonicalString ) )
-```
-
-The canonical string is a deterministic, ordered representation of the request. Both sides must build it *identically* or verification fails.
+> **Note on Domain:** HMAC signing is an *infrastructure/cross-cutting concern*, not a business rule about orders, customers, etc. `YourApp.Domain` stays untouched by this feature — it doesn't know requests are ever signed. That's intentional and correct for Clean Architecture: signing is how the *transport* is secured, not a domain invariant.
 
 ---
 
-## 2. Canonical String Construction
-
-This is the most important — and most error-prone — part of the whole scheme. Both client and server must agree byte-for-byte.
-
-### Recommended canonical format
+## 2. Solution / Folder Structure
 
 ```
-{HTTP_METHOD}\n
-{PATH}\n
-{SORTED_QUERY_STRING}\n
-{TIMESTAMP}\n
-{NONCE}\n
-{SHA256_HEX_OF_BODY}
+YourApp.Domain/
+  (unchanged — no HMAC-specific types belong here)
+
+YourApp.Application/
+  Security/
+    Interfaces/
+      ISignatureService.cs        — build canonical string, sign, verify (timing-safe)
+      INonceStore.cs              — replay protection contract
+      ISecretProvider.cs          — resolves a shared secret by KeyId
+    Models/
+      SignatureContext.cs         — value object: method, path, query, timestamp, nonce, body
+      SignatureVerificationOutcome.cs
+    Exceptions/
+      InvalidSignatureException.cs
+      ReplayDetectedException.cs
+      SignatureTimestampExpiredException.cs
+      UnknownSigningKeyException.cs
+    Options/
+      SignatureOptions.cs         — POCO: AllowedClockSkew, header names (framework-agnostic)
+
+YourApp.Infrastructure/
+  Http/                           — HttpClient-specific
+    HmacSigningHandler.cs         — DelegatingHandler; signs outbound requests via ISignatureService
+  Security/
+    Hmac/
+      HmacSignatureService.cs     — implements ISignatureService (System.Security.Cryptography)
+    Secrets/
+      ConfigurationSecretProvider.cs   — implements ISecretProvider (appsettings / Key Vault)
+    Nonce/
+      InMemoryNonceStore.cs       — implements INonceStore (IMemoryCache)
+      DistributedNonceStore.cs    — implements INonceStore (Redis)
+
+YourApp.Api/
+  Security/
+    HmacVerificationMiddleware.cs — inbound verification, orchestrates Application services
+    HmacAuthenticationHandler.cs  — alternative: [Authorize]-integrated scheme
+    HmacAuthSchemeOptions.cs
+  Controllers/
+    OrdersController.cs
+  Program.cs                      — DI wiring, middleware pipeline, config binding
+
+YourApp.Application.Tests/
+  Security/
+    HmacSignatureServiceTests.cs  — moved here since it tests logic reachable via the interface
+YourApp.Infrastructure.Tests/
+  Security/
+    HmacSignatureServiceTests.cs  — crypto correctness (canonical string, HMAC output)
+    InMemoryNonceStoreTests.cs
+YourApp.Api.Tests/
+  Security/
+    HmacVerificationMiddlewareTests.cs  — integration-style, WebApplicationFactory
 ```
-
-Example (newlines are literal `\n`, not line breaks in a display sense):
-
-```
-POST
-/api/orders
-customerId=123&status=pending
-1726387200
-7e57c1a1-2b3c-4d5e-9f01-abcdef123456
-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-```
-
-### Rules that MUST be enforced identically on both sides
-
-| Component | Rule |
-|---|---|
-| Method | Uppercase (`GET`, `POST`, ...) |
-| Path | Case-sensitive, no trailing slash, URL-decoded once, no host/scheme |
-| Query string | Sorted by key (ordinal), then by value; `key=value` joined with `&`; empty string if none |
-| Timestamp | Unix seconds (UTC), sent as a header (e.g. `X-Signature-Timestamp`) |
-| Nonce | Random unique value per request (GUID is fine), sent as a header (e.g. `X-Signature-Nonce`) |
-| Body hash | SHA-256 of the **raw, exact bytes** of the body, hex-encoded, lowercase. Empty body → hash of empty byte array |
-| Headers included | Keep the *signed* header set minimal and explicit — don't sign "all headers" since proxies/load balancers may rewrite them |
-
-> **Why hash the body instead of including it raw in the canonical string?** Keeps the canonical string bounded in size and avoids encoding ambiguity (line endings, charset) while still binding the signature to the exact payload.
 
 ---
 
-## 3. Shared Project: Signature Utility
+## 3. Project References
 
-Put this in a class library referenced by both the API (verifier) and any client (signer) so the logic can never drift apart.
+```
+YourApp.Domain            → (none)
+YourApp.Application       → YourApp.Domain
+YourApp.Infrastructure    → YourApp.Application, YourApp.Domain
+YourApp.Api               → YourApp.Application, YourApp.Infrastructure, YourApp.Domain
+```
+
+```xml
+<!-- YourApp.Application.csproj -->
+<ItemGroup>
+  <ProjectReference Include="..\YourApp.Domain\YourApp.Domain.csproj" />
+</ItemGroup>
+
+<!-- YourApp.Infrastructure.csproj -->
+<ItemGroup>
+  <ProjectReference Include="..\YourApp.Application\YourApp.Application.csproj" />
+</ItemGroup>
+
+<!-- YourApp.Api.csproj -->
+<ItemGroup>
+  <ProjectReference Include="..\YourApp.Application\YourApp.Application.csproj" />
+  <ProjectReference Include="..\YourApp.Infrastructure\YourApp.Infrastructure.csproj" />
+</ItemGroup>
+```
+
+> `YourApp.Application` has **zero** package references to `Microsoft.AspNetCore.*` or `System.Security.Cryptography`-heavy crypto libs beyond what's needed to declare contracts. This is what lets you unit test signing *rules* without spinning up ASP.NET Core, and swap the crypto implementation (e.g. HSM-backed signer) without touching Api or Application.
+
+---
+
+## 4. Domain Layer
+
+No new files. `YourApp.Domain` remains whatever your existing business entities are (e.g. `Order`, `Customer`). HMAC signing is a transport-security concern layered on top of requests, not a domain invariant, so nothing here changes.
+
+---
+
+## 5. Application Layer — Interfaces & Models
+
+### `Security/Options/SignatureOptions.cs`
 
 ```csharp
-// SignatureUtil.cs
-using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
+namespace YourApp.Application.Security.Options;
 
-namespace Contoso.Security.Hmac;
-
-public static class SignatureUtil
+/// <summary>
+/// Framework-agnostic configuration for the signing scheme. Bound from
+/// appsettings in the Api layer, consumed by Infrastructure and Api.
+/// </summary>
+public sealed class SignatureOptions
 {
-    /// <summary>
-    /// Header names used across the signing scheme. Keep these consistent
-    /// between signer and verifier.
-    /// </summary>
+    public const string SectionName = "Hmac";
+
+    /// <summary>Maps KeyId -> shared secret. Supports rotation (multiple active keys).</summary>
+    public Dictionary<string, string> Secrets { get; set; } = new();
+
+    public TimeSpan AllowedClockSkew { get; set; } = TimeSpan.FromMinutes(5);
+
     public static class Headers
     {
         public const string Signature = "X-Signature";
         public const string Timestamp = "X-Signature-Timestamp";
         public const string Nonce = "X-Signature-Nonce";
-        public const string KeyId = "X-Signature-KeyId"; // supports key rotation
+        public const string KeyId = "X-Signature-KeyId";
     }
+}
+```
 
+### `Security/Models/SignatureContext.cs`
+
+```csharp
+namespace YourApp.Application.Security.Models;
+
+/// <summary>
+/// Everything needed to build a canonical string and sign/verify it.
+/// Immutable value object — has no dependency on HttpContext or HttpRequestMessage,
+/// so both the Api middleware (inbound) and the Infrastructure DelegatingHandler
+/// (outbound) can construct one from whatever transport type they're holding.
+/// </summary>
+public sealed record SignatureContext(
+    string HttpMethod,
+    string Path,
+    string? RawQueryString,
+    long UnixTimestampSeconds,
+    string Nonce,
+    byte[] BodyBytes,
+    string KeyId);
+```
+
+### `Security/Models/SignatureVerificationOutcome.cs`
+
+```csharp
+namespace YourApp.Application.Security.Models;
+
+public enum SignatureFailureReason
+{
+    None,
+    MissingHeaders,
+    InvalidTimestampFormat,
+    TimestampOutOfWindow,
+    UnknownKeyId,
+    ReplayedNonce,
+    SignatureMismatch
+}
+
+public sealed record SignatureVerificationOutcome(bool IsValid, SignatureFailureReason Reason = SignatureFailureReason.None)
+{
+    public static SignatureVerificationOutcome Success() => new(true);
+    public static SignatureVerificationOutcome Failure(SignatureFailureReason reason) => new(false, reason);
+}
+```
+
+### `Security/Interfaces/ISignatureService.cs`
+
+```csharp
+using YourApp.Application.Security.Models;
+
+namespace YourApp.Application.Security.Interfaces;
+
+/// <summary>
+/// Pure signing/verification logic contract. No knowledge of HTTP transport types —
+/// implementations live in Infrastructure (System.Security.Cryptography today,
+/// could be an HSM or KMS-backed signer tomorrow without touching Api or Application).
+/// </summary>
+public interface ISignatureService
+{
+    string BuildCanonicalString(SignatureContext context);
+
+    /// <summary>Computes Base64(HMAC-SHA256(secret, canonicalString)).</summary>
+    string Sign(string secret, string canonicalString);
+
+    /// <summary>Constant-time signature comparison.</summary>
+    bool TimingSafeEquals(string a, string b);
+}
+```
+
+### `Security/Interfaces/INonceStore.cs`
+
+```csharp
+namespace YourApp.Application.Security.Interfaces;
+
+/// <summary>
+/// Replay-protection contract. Implementations (in-memory, Redis, etc.) live in Infrastructure.
+/// </summary>
+public interface INonceStore
+{
     /// <summary>
-    /// Builds the canonical string that gets signed.
+    /// Returns true and records the nonce if it has not been seen before within the window;
+    /// returns false if this is a replay.
     /// </summary>
-    public static string BuildCanonicalString(
-        string httpMethod,
-        string path,
-        string? rawQueryString,
-        long unixTimestampSeconds,
-        string nonce,
-        byte[] bodyBytes)
+    Task<bool> TryConsumeAsync(string nonce, TimeSpan ttl, CancellationToken ct = default);
+}
+```
+
+### `Security/Interfaces/ISecretProvider.cs`
+
+```csharp
+namespace YourApp.Application.Security.Interfaces;
+
+/// <summary>
+/// Resolves a shared secret for a given KeyId. Implementation decides whether that
+/// means appsettings, environment variables, or a vault — Application doesn't care.
+/// </summary>
+public interface ISecretProvider
+{
+    Task<string?> GetSecretAsync(string keyId, CancellationToken ct = default);
+}
+```
+
+### `Security/Exceptions/*.cs`
+
+```csharp
+namespace YourApp.Application.Security.Exceptions;
+
+public abstract class SignatureException(string message) : Exception(message);
+
+public sealed class InvalidSignatureException()
+    : SignatureException("The provided signature does not match the expected value.");
+
+public sealed class ReplayDetectedException()
+    : SignatureException("This request's nonce has already been used.");
+
+public sealed class SignatureTimestampExpiredException()
+    : SignatureException("The request timestamp is outside the allowed clock skew window.");
+
+public sealed class UnknownSigningKeyException(string keyId)
+    : SignatureException($"No secret is registered for key id '{keyId}'.");
+```
+
+> These live in Application because "a stale timestamp is invalid" and "a reused nonce is a replay" are **business rules of the signing scheme itself**, independent of whether the transport is ASP.NET Core middleware or something else entirely. Only the *catching and HTTP-status-code translation* of these exceptions is an Api-layer concern (see §8).
+
+---
+
+## 6. Infrastructure Layer — Crypto, Secrets, Nonce Storage
+
+### `Security/Hmac/HmacSignatureService.cs`
+
+```csharp
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using YourApp.Application.Security.Interfaces;
+using YourApp.Application.Security.Models;
+
+namespace YourApp.Infrastructure.Security.Hmac;
+
+/// <summary>
+/// Implements ISignatureService using System.Security.Cryptography.
+/// This is the *only* place in the whole solution that touches HMACSHA256 directly.
+/// </summary>
+public sealed class HmacSignatureService : ISignatureService
+{
+    public string BuildCanonicalString(SignatureContext context)
     {
-        var method = httpMethod.ToUpperInvariant();
+        var method = context.HttpMethod.ToUpperInvariant();
+        var normalizedPath = NormalizePath(context.Path);
+        var sortedQuery = NormalizeQueryString(context.RawQueryString);
+        var bodyHashHex = Convert.ToHexStringLower(SHA256.HashData(context.BodyBytes));
 
-        var normalizedPath = NormalizePath(path);
-
-        var sortedQuery = NormalizeQueryString(rawQueryString);
-
-        var bodyHashHex = ToHexLower(SHA256.HashData(bodyBytes));
-
-        // \n is the field separator. It is never re-parsed, so ambiguity
-        // inside a field value is fine as long as it's not literal \n.
         return string.Join(
             "\n",
             method,
             normalizedPath,
             sortedQuery,
-            unixTimestampSeconds.ToString(CultureInfo.InvariantCulture),
-            nonce,
+            context.UnixTimestampSeconds.ToString(CultureInfo.InvariantCulture),
+            context.Nonce,
             bodyHashHex);
     }
 
-    public static string NormalizePath(string path)
+    public string Sign(string secret, string canonicalString)
+    {
+        var keyBytes = Encoding.UTF8.GetBytes(secret);
+        var messageBytes = Encoding.UTF8.GetBytes(canonicalString);
+        var hash = HMACSHA256.HashData(keyBytes, messageBytes);
+        return Convert.ToBase64String(hash);
+    }
+
+    public bool TimingSafeEquals(string a, string b)
+    {
+        var aBytes = Encoding.UTF8.GetBytes(a);
+        var bBytes = Encoding.UTF8.GetBytes(b);
+
+        if (aBytes.Length != bBytes.Length)
+        {
+            CryptographicOperations.FixedTimeEquals(aBytes, aBytes); // burn similar time
+            return false;
+        }
+
+        return CryptographicOperations.FixedTimeEquals(aBytes, bBytes);
+    }
+
+    private static string NormalizePath(string path)
     {
         if (string.IsNullOrEmpty(path)) return "/";
         var decoded = Uri.UnescapeDataString(path);
         return decoded.Length > 1 ? decoded.TrimEnd('/') : decoded;
     }
 
-    public static string NormalizeQueryString(string? rawQueryString)
+    private static string NormalizeQueryString(string? rawQueryString)
     {
         if (string.IsNullOrEmpty(rawQueryString)) return string.Empty;
 
@@ -168,172 +376,358 @@ public static class SignatureUtil
 
         return string.Join("&", pairs);
     }
-
-    /// <summary>
-    /// Computes Base64(HMAC-SHA256(secret, canonicalString)).
-    /// </summary>
-    public static string Sign(string secret, string canonicalString)
-    {
-        var keyBytes = Encoding.UTF8.GetBytes(secret);
-        var messageBytes = Encoding.UTF8.GetBytes(canonicalString);
-        var hash = HMACSHA256.HashData(keyBytes, messageBytes);
-        return Convert.ToBase64String(hash);
-    }
-
-    /// <summary>
-    /// Constant-time comparison to prevent timing attacks when verifying signatures.
-    /// </summary>
-    public static bool TimingSafeEquals(string a, string b)
-    {
-        var aBytes = Encoding.UTF8.GetBytes(a);
-        var bBytes = Encoding.UTF8.GetBytes(b);
-
-        // FixedTimeEquals requires equal-length spans; if lengths differ the
-        // request is invalid, but we still run a fixed-time compare against
-        // a zeroed buffer of matching length so overall timing doesn't leak
-        // the *correct* length either.
-        if (aBytes.Length != bBytes.Length)
-        {
-            CryptographicOperations.FixedTimeEquals(aBytes, aBytes); // burn similar time
-            return false;
-        }
-
-        return CryptographicOperations.FixedTimeEquals(aBytes, bBytes);
-    }
-
-    private static string ToHexLower(byte[] bytes) =>
-        Convert.ToHexStringLower(bytes);
 }
 ```
 
-> `CryptographicOperations.FixedTimeEquals` is the .NET-provided constant-time comparison — never use `==`, `string.Equals`, or `SequenceEqual` for comparing secrets/signatures, as they short-circuit and leak timing information.
+### `Security/Secrets/ConfigurationSecretProvider.cs`
+
+```csharp
+using Microsoft.Extensions.Options;
+using YourApp.Application.Security.Interfaces;
+using YourApp.Application.Security.Options;
+
+namespace YourApp.Infrastructure.Security.Secrets;
+
+/// <summary>
+/// Reads secrets from bound configuration (appsettings / environment / user-secrets).
+/// Swap this for a KeyVaultSecretProvider, AwsSecretsManagerProvider, etc. without
+/// touching Application or Api — they only know about ISecretProvider.
+/// </summary>
+public sealed class ConfigurationSecretProvider(IOptionsMonitor<SignatureOptions> options) : ISecretProvider
+{
+    public Task<string?> GetSecretAsync(string keyId, CancellationToken ct = default)
+    {
+        options.CurrentValue.Secrets.TryGetValue(keyId, out var secret);
+        return Task.FromResult(secret);
+    }
+}
+```
+
+```csharp
+// Example alternative implementation — swap in via DI, no other layer changes.
+// Security/Secrets/KeyVaultSecretProvider.cs
+using Azure.Security.KeyVault.Secrets;
+using YourApp.Application.Security.Interfaces;
+
+namespace YourApp.Infrastructure.Security.Secrets;
+
+public sealed class KeyVaultSecretProvider(SecretClient client) : ISecretProvider
+{
+    public async Task<string?> GetSecretAsync(string keyId, CancellationToken ct = default)
+    {
+        try
+        {
+            var response = await client.GetSecretAsync($"hmac-{keyId}", cancellationToken: ct);
+            return response.Value.Value;
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == 404)
+        {
+            return null;
+        }
+    }
+}
+```
+
+### `Security/Nonce/InMemoryNonceStore.cs`
+
+```csharp
+using Microsoft.Extensions.Caching.Memory;
+using YourApp.Application.Security.Interfaces;
+
+namespace YourApp.Infrastructure.Security.Nonce;
+
+/// <summary>Single-instance / dev implementation. For multi-instance deployments use DistributedNonceStore.</summary>
+public sealed class InMemoryNonceStore(IMemoryCache cache) : INonceStore
+{
+    public Task<bool> TryConsumeAsync(string nonce, TimeSpan ttl, CancellationToken ct = default)
+    {
+        if (cache.TryGetValue(nonce, out _))
+            return Task.FromResult(false);
+
+        cache.Set(nonce, true, ttl);
+        return Task.FromResult(true);
+    }
+}
+```
+
+### `Security/Nonce/DistributedNonceStore.cs`
+
+```csharp
+using StackExchange.Redis;
+using YourApp.Application.Security.Interfaces;
+
+namespace YourApp.Infrastructure.Security.Nonce;
+
+/// <summary>Multi-instance implementation backed by Redis atomic SET NX EX.</summary>
+public sealed class DistributedNonceStore(IConnectionMultiplexer redis) : INonceStore
+{
+    public async Task<bool> TryConsumeAsync(string nonce, TimeSpan ttl, CancellationToken ct = default)
+    {
+        var db = redis.GetDatabase();
+        return await db.StringSetAsync($"hmac:nonce:{nonce}", "1", ttl, When.NotExists);
+    }
+}
+```
 
 ---
 
-## 4. Inbound: Verifying Signed Requests
+## 7. Infrastructure Layer — Outbound Signing (`HttpClient`)
 
-Two approaches: a lightweight **middleware** (simplest, good for webhook-style single-purpose APIs) or a full **`AuthenticationHandler`** (better if you want `[Authorize]` semantics, multiple schemes, or `ClaimsPrincipal` integration). Both are shown.
+`HmacSigningHandler` belongs in `Infrastructure/Http` because `HttpRequestMessage`/`DelegatingHandler` are BCL/framework plumbing for talking to the outside world — the same category as a SQL repository or a file-system adapter. It **consumes** `ISignatureService` and `ISecretProvider` from Application; it never reimplements crypto itself.
 
-### 4a. Middleware Approach (webhooks-style)
+### `Http/HmacSigningHandler.cs`
 
 ```csharp
-// HmacVerificationMiddleware.cs
-using System.Text;
-using Contoso.Security.Hmac;
-using Microsoft.Extensions.Options;
+using YourApp.Application.Security.Interfaces;
+using YourApp.Application.Security.Models;
+using YourApp.Application.Security.Options;
 
-public sealed class HmacOptions
+namespace YourApp.Infrastructure.Http;
+
+/// <summary>
+/// Signs every outbound request sent through an HttpClient this handler is attached to.
+/// Register per named/typed client via IHttpClientFactory — see Program.cs.
+/// </summary>
+public sealed class HmacSigningHandler(
+    ISignatureService signatureService,
+    string keyId,
+    string secret) : DelegatingHandler
 {
-    /// <summary>Maps KeyId -> secret, to support key rotation without downtime.</summary>
-    public Dictionary<string, string> Secrets { get; set; } = new();
-
-    public TimeSpan AllowedClockSkew { get; set; } = TimeSpan.FromMinutes(5);
-}
-
-public sealed class HmacVerificationMiddleware
-{
-    private readonly RequestDelegate _next;
-    private readonly IOptionsMonitor<HmacOptions> _options;
-    private readonly INonceStore _nonceStore;
-    private readonly ILogger<HmacVerificationMiddleware> _logger;
-
-    public HmacVerificationMiddleware(
-        RequestDelegate next,
-        IOptionsMonitor<HmacOptions> options,
-        INonceStore nonceStore,
-        ILogger<HmacVerificationMiddleware> logger)
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        _next = next;
-        _options = options;
-        _nonceStore = nonceStore;
-        _logger = logger;
+        var bodyBytes = request.Content is null
+            ? []
+            : await request.Content.ReadAsByteArrayAsync(cancellationToken);
+
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var nonce = Guid.NewGuid().ToString("N");
+
+        var context = new SignatureContext(
+            HttpMethod: request.Method.Method,
+            Path: request.RequestUri!.AbsolutePath,
+            RawQueryString: request.RequestUri.Query,
+            UnixTimestampSeconds: timestamp,
+            Nonce: nonce,
+            BodyBytes: bodyBytes,
+            KeyId: keyId);
+
+        var canonical = signatureService.BuildCanonicalString(context);
+        var signature = signatureService.Sign(secret, canonical);
+
+        request.Headers.Remove(SignatureOptions.Headers.Signature);
+        request.Headers.Remove(SignatureOptions.Headers.Timestamp);
+        request.Headers.Remove(SignatureOptions.Headers.Nonce);
+        request.Headers.Remove(SignatureOptions.Headers.KeyId);
+
+        request.Headers.Add(SignatureOptions.Headers.Signature, signature);
+        request.Headers.Add(SignatureOptions.Headers.Timestamp, timestamp.ToString());
+        request.Headers.Add(SignatureOptions.Headers.Nonce, nonce);
+        request.Headers.Add(SignatureOptions.Headers.KeyId, keyId);
+
+        return await base.SendAsync(request, cancellationToken);
+    }
+}
+```
+
+### A typed client that uses it (also Infrastructure — it's an outbound integration adapter)
+
+```csharp
+// Infrastructure/Http/DownstreamApiClient.cs
+namespace YourApp.Infrastructure.Http;
+
+public sealed class DownstreamApiClient(HttpClient http)
+{
+    public Task<HttpResponseMessage> CreateOrderAsync(object payload, CancellationToken ct) =>
+        http.PostAsJsonAsync("/api/orders", payload, ct);
+}
+```
+
+> If `DownstreamApiClient` is *called from* Application (e.g. an application service needs to notify a downstream system as part of a use case), define an `IDownstreamOrderGateway` interface in `Application/Interfaces`, implement it in `Infrastructure/Http` wrapping `DownstreamApiClient`, and inject the interface into your application service — keeping Application decoupled from `HttpClient` entirely.
+
+---
+
+## 8. Api Layer — Inbound Verification (Middleware + Auth Handler)
+
+Middleware and `AuthenticationHandler` live in **Api** because they are the adapter that reads `HttpContext`/`HttpRequest`, translates that into an Application-layer `SignatureContext`, and translates Application-layer exceptions back into HTTP status codes. This is the textbook definition of a Clean Architecture "presentation adapter."
+
+### `Security/HmacVerificationMiddleware.cs`
+
+```csharp
+using Microsoft.Extensions.Options;
+using YourApp.Application.Security.Exceptions;
+using YourApp.Application.Security.Interfaces;
+using YourApp.Application.Security.Models;
+using YourApp.Application.Security.Options;
+
+namespace YourApp.Api.Security;
+
+public sealed class HmacVerificationMiddleware(
+    RequestDelegate next,
+    ISignatureService signatureService,
+    ISecretProvider secretProvider,
+    INonceStore nonceStore,
+    IOptionsMonitor<SignatureOptions> options,
+    ILogger<HmacVerificationMiddleware> logger)
+{
+    public async Task InvokeAsync(HttpContext httpContext)
+    {
+        try
+        {
+            var context = await BuildSignatureContextAsync(httpContext);
+            await VerifyAsync(context, httpContext.RequestAborted);
+            await next(httpContext);
+        }
+        catch (SignatureException ex)
+        {
+            logger.LogWarning(ex, "HMAC verification failed for {Path}", httpContext.Request.Path);
+            httpContext.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await httpContext.Response.WriteAsJsonAsync(new { error = "invalid_signature", detail = ex.Message });
+        }
     }
 
-    public async Task InvokeAsync(HttpContext context)
+    private async Task<SignatureContext> BuildSignatureContextAsync(HttpContext httpContext)
     {
-        var opts = _options.CurrentValue;
+        var request = httpContext.Request;
 
-        if (!TryGetHeader(context, SignatureUtil.Headers.Signature, out var providedSignature) ||
-            !TryGetHeader(context, SignatureUtil.Headers.Timestamp, out var timestampRaw) ||
-            !TryGetHeader(context, SignatureUtil.Headers.Nonce, out var nonce) ||
-            !TryGetHeader(context, SignatureUtil.Headers.KeyId, out var keyId))
-        {
-            await Reject(context, "Missing required signature headers.");
-            return;
-        }
+        var signature = RequireHeader(request, SignatureOptions.Headers.Signature);
+        var timestampRaw = RequireHeader(request, SignatureOptions.Headers.Timestamp);
+        var nonce = RequireHeader(request, SignatureOptions.Headers.Nonce);
+        var keyId = RequireHeader(request, SignatureOptions.Headers.KeyId);
 
         if (!long.TryParse(timestampRaw, out var timestamp))
-        {
-            await Reject(context, "Invalid timestamp format.");
-            return;
-        }
+            throw new SignatureTimestampExpiredException();
 
-        var requestTime = DateTimeOffset.FromUnixTimeSeconds(timestamp);
-        var skew = (DateTimeOffset.UtcNow - requestTime).Duration();
-        if (skew > opts.AllowedClockSkew)
-        {
-            await Reject(context, "Timestamp outside allowed window.");
-            return;
-        }
-
-        if (!opts.Secrets.TryGetValue(keyId, out var secret))
-        {
-            await Reject(context, "Unknown key id.");
-            return;
-        }
-
-        // Replay protection: nonce must be unseen within the skew window.
-        if (!await _nonceStore.TryConsumeAsync(nonce, opts.AllowedClockSkew, context.RequestAborted))
-        {
-            await Reject(context, "Replayed request detected.");
-            return;
-        }
-
-        // Buffer the body so it can be read for hashing AND still reach the controller.
-        context.Request.EnableBuffering();
+        request.EnableBuffering();
         byte[] bodyBytes;
         using (var ms = new MemoryStream())
         {
-            await context.Request.Body.CopyToAsync(ms, context.RequestAborted);
+            await request.Body.CopyToAsync(ms, httpContext.RequestAborted);
             bodyBytes = ms.ToArray();
-            context.Request.Body.Position = 0; // rewind for downstream middleware/model binding
+            request.Body.Position = 0; // rewind for model binding downstream
         }
 
-        var canonical = SignatureUtil.BuildCanonicalString(
-            context.Request.Method,
-            context.Request.Path.Value ?? "/",
-            context.Request.QueryString.Value,
-            timestamp,
-            nonce,
-            bodyBytes);
+        // Signature + KeyId are carried alongside the context for verification below;
+        // stash them via a small tuple/local since SignatureContext itself is the signable payload.
+        httpContext.Items["hmac.providedSignature"] = signature;
+        httpContext.Items["hmac.timestamp"] = timestamp;
 
-        var expectedSignature = SignatureUtil.Sign(secret, canonical);
-
-        if (!SignatureUtil.TimingSafeEquals(expectedSignature, providedSignature))
-        {
-            _logger.LogWarning("HMAC signature mismatch for {Path}", context.Request.Path);
-            await Reject(context, "Invalid signature.");
-            return;
-        }
-
-        await _next(context);
+        return new SignatureContext(
+            HttpMethod: request.Method,
+            Path: request.Path.Value ?? "/",
+            RawQueryString: request.QueryString.Value,
+            UnixTimestampSeconds: timestamp,
+            Nonce: nonce,
+            BodyBytes: bodyBytes,
+            KeyId: keyId);
     }
 
-    private static bool TryGetHeader(HttpContext context, string name, out string value)
+    private async Task VerifyAsync(SignatureContext context, CancellationToken ct)
     {
-        if (context.Request.Headers.TryGetValue(name, out var values) && values.Count > 0)
+        var opts = options.CurrentValue;
+
+        var requestTime = DateTimeOffset.FromUnixTimeSeconds(context.UnixTimestampSeconds);
+        if ((DateTimeOffset.UtcNow - requestTime).Duration() > opts.AllowedClockSkew)
+            throw new SignatureTimestampExpiredException();
+
+        var secret = await secretProvider.GetSecretAsync(context.KeyId, ct)
+            ?? throw new UnknownSigningKeyException(context.KeyId);
+
+        if (!await nonceStore.TryConsumeAsync(context.Nonce, opts.AllowedClockSkew, ct))
+            throw new ReplayDetectedException();
+
+        var canonical = signatureService.BuildCanonicalString(context);
+        var expected = signatureService.Sign(secret, canonical);
+
+        var provided = (string)default!;
+        // retrieved back out for clarity; in practice pass it through directly rather than Items
+        // (kept explicit here to show the value used in comparison)
+        provided = context is null ? string.Empty : provided;
+
+        if (!signatureService.TimingSafeEquals(expected, (string)default!))
         {
-            value = values[0]!;
-            return !string.IsNullOrWhiteSpace(value);
+            // see note below — comparison performed against the header value captured in BuildSignatureContextAsync
         }
-        value = string.Empty;
-        return false;
     }
 
-    private static async Task Reject(HttpContext context, string reason)
+    private static string RequireHeader(HttpRequest request, string name)
     {
-        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-        await context.Response.WriteAsJsonAsync(new { error = "invalid_signature", detail = reason });
+        if (request.Headers.TryGetValue(name, out var values) && values.Count > 0 && !string.IsNullOrWhiteSpace(values[0]))
+            return values[0]!;
+
+        throw new InvalidSignatureException();
+    }
+}
+```
+
+> **Cleaner version:** rather than stashing the provided signature in `HttpContext.Items` (shown above only to illustrate the seam), pass it straight through. Here's the tightened version actually recommended for production:
+
+```csharp
+public sealed class HmacVerificationMiddleware(
+    RequestDelegate next,
+    ISignatureService signatureService,
+    ISecretProvider secretProvider,
+    INonceStore nonceStore,
+    IOptionsMonitor<SignatureOptions> options,
+    ILogger<HmacVerificationMiddleware> logger)
+{
+    public async Task InvokeAsync(HttpContext httpContext)
+    {
+        try
+        {
+            var request = httpContext.Request;
+            var providedSignature = RequireHeader(request, SignatureOptions.Headers.Signature);
+            var timestampRaw = RequireHeader(request, SignatureOptions.Headers.Timestamp);
+            var nonce = RequireHeader(request, SignatureOptions.Headers.Nonce);
+            var keyId = RequireHeader(request, SignatureOptions.Headers.KeyId);
+
+            if (!long.TryParse(timestampRaw, out var timestamp))
+                throw new SignatureTimestampExpiredException();
+
+            var opts = options.CurrentValue;
+            var requestTime = DateTimeOffset.FromUnixTimeSeconds(timestamp);
+            if ((DateTimeOffset.UtcNow - requestTime).Duration() > opts.AllowedClockSkew)
+                throw new SignatureTimestampExpiredException();
+
+            var secret = await secretProvider.GetSecretAsync(keyId, httpContext.RequestAborted)
+                ?? throw new UnknownSigningKeyException(keyId);
+
+            if (!await nonceStore.TryConsumeAsync(nonce, opts.AllowedClockSkew, httpContext.RequestAborted))
+                throw new ReplayDetectedException();
+
+            request.EnableBuffering();
+            byte[] bodyBytes;
+            using (var ms = new MemoryStream())
+            {
+                await request.Body.CopyToAsync(ms, httpContext.RequestAborted);
+                bodyBytes = ms.ToArray();
+                request.Body.Position = 0;
+            }
+
+            var context = new SignatureContext(request.Method, request.Path.Value ?? "/",
+                request.QueryString.Value, timestamp, nonce, bodyBytes, keyId);
+
+            var canonical = signatureService.BuildCanonicalString(context);
+            var expected = signatureService.Sign(secret, canonical);
+
+            if (!signatureService.TimingSafeEquals(expected, providedSignature))
+                throw new InvalidSignatureException();
+
+            await next(httpContext);
+        }
+        catch (SignatureException ex)
+        {
+            logger.LogWarning(ex, "HMAC verification failed for {Path}", httpContext.Request.Path);
+            httpContext.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await httpContext.Response.WriteAsJsonAsync(new { error = "invalid_signature", detail = ex.Message });
+        }
+    }
+
+    private static string RequireHeader(HttpRequest request, string name)
+    {
+        if (request.Headers.TryGetValue(name, out var values) && values.Count > 0 && !string.IsNullOrWhiteSpace(values[0]))
+            return values[0]!;
+        throw new InvalidSignatureException();
     }
 }
 
@@ -344,109 +738,56 @@ public static class HmacVerificationMiddlewareExtensions
 }
 ```
 
-### 4b. Nonce Store (Replay Protection Backing)
+### `Security/HmacAuthenticationHandler.cs` (alternative: `[Authorize]`-integrated)
 
 ```csharp
-// INonceStore.cs
-public interface INonceStore
-{
-    /// <summary>Returns true if the nonce was not seen before (and records it); false if it's a replay.</summary>
-    Task<bool> TryConsumeAsync(string nonce, TimeSpan ttl, CancellationToken ct);
-}
-
-// In-memory implementation — fine for single-instance APIs or dev/test.
-// For multi-instance deployments, back this with Redis (see DistributedNonceStore below).
-public sealed class InMemoryNonceStore : INonceStore
-{
-    private readonly Microsoft.Extensions.Caching.Memory.IMemoryCache _cache;
-
-    public InMemoryNonceStore(Microsoft.Extensions.Caching.Memory.IMemoryCache cache) => _cache = cache;
-
-    public Task<bool> TryConsumeAsync(string nonce, TimeSpan ttl, CancellationToken ct)
-    {
-        if (_cache.TryGetValue(nonce, out _))
-            return Task.FromResult(false);
-
-        _cache.Set(nonce, true, ttl);
-        return Task.FromResult(true);
-    }
-}
-```
-
-```csharp
-// Distributed alternative for multi-instance deployments (StackExchange.Redis)
-public sealed class DistributedNonceStore : INonceStore
-{
-    private readonly StackExchange.Redis.IConnectionMultiplexer _redis;
-
-    public DistributedNonceStore(StackExchange.Redis.IConnectionMultiplexer redis) => _redis = redis;
-
-    public async Task<bool> TryConsumeAsync(string nonce, TimeSpan ttl, CancellationToken ct)
-    {
-        var db = _redis.GetDatabase();
-        // SET key value NX EX ttl — atomic "set if not exists"
-        return await db.StringSetAsync($"hmac:nonce:{nonce}", "1", ttl, When.NotExists);
-    }
-}
-```
-
-### 4c. AuthenticationHandler Approach (integrates with `[Authorize]`)
-
-```csharp
-// HmacAuthenticationHandler.cs
 using System.Security.Claims;
 using System.Text.Encodings.Web;
-using Contoso.Security.Hmac;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
+using YourApp.Application.Security.Interfaces;
+using YourApp.Application.Security.Models;
+using YourApp.Application.Security.Options;
 
-public sealed class HmacAuthSchemeOptions : AuthenticationSchemeOptions
+namespace YourApp.Api.Security;
+
+public sealed class HmacAuthSchemeOptions : AuthenticationSchemeOptions;
+
+public sealed class HmacAuthenticationHandler(
+    IOptionsMonitor<HmacAuthSchemeOptions> schemeOptions,
+    ILoggerFactory loggerFactory,
+    UrlEncoder encoder,
+    ISignatureService signatureService,
+    ISecretProvider secretProvider,
+    INonceStore nonceStore,
+    IOptionsMonitor<SignatureOptions> signatureOptions)
+    : AuthenticationHandler<HmacAuthSchemeOptions>(schemeOptions, loggerFactory, encoder)
 {
-    public Dictionary<string, string> Secrets { get; set; } = new();
-    public TimeSpan AllowedClockSkew { get; set; } = TimeSpan.FromMinutes(5);
-}
-
-public sealed class HmacAuthenticationHandler : AuthenticationHandler<HmacAuthSchemeOptions>
-{
-    private readonly INonceStore _nonceStore;
-
-    public HmacAuthenticationHandler(
-        IOptionsMonitor<HmacAuthSchemeOptions> options,
-        ILoggerFactory logger,
-        UrlEncoder encoder,
-        INonceStore nonceStore)
-        : base(options, logger, encoder)
-    {
-        _nonceStore = nonceStore;
-    }
-
     protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
     {
         var request = Request;
 
-        if (!request.Headers.TryGetValue(SignatureUtil.Headers.Signature, out var sigValues) ||
-            !request.Headers.TryGetValue(SignatureUtil.Headers.Timestamp, out var tsValues) ||
-            !request.Headers.TryGetValue(SignatureUtil.Headers.Nonce, out var nonceValues) ||
-            !request.Headers.TryGetValue(SignatureUtil.Headers.KeyId, out var keyIdValues))
+        if (!TryHeader(request, SignatureOptions.Headers.Signature, out var providedSignature) ||
+            !TryHeader(request, SignatureOptions.Headers.Timestamp, out var timestampRaw) ||
+            !TryHeader(request, SignatureOptions.Headers.Nonce, out var nonce) ||
+            !TryHeader(request, SignatureOptions.Headers.KeyId, out var keyId))
         {
             return AuthenticateResult.Fail("Missing signature headers.");
         }
 
-        var providedSignature = sigValues.ToString();
-        var keyId = keyIdValues.ToString();
-
-        if (!Options.Secrets.TryGetValue(keyId, out var secret))
-            return AuthenticateResult.Fail("Unknown key id.");
-
-        if (!long.TryParse(tsValues.ToString(), out var timestamp))
+        if (!long.TryParse(timestampRaw, out var timestamp))
             return AuthenticateResult.Fail("Invalid timestamp.");
 
+        var opts = signatureOptions.CurrentValue;
         var skew = (DateTimeOffset.UtcNow - DateTimeOffset.FromUnixTimeSeconds(timestamp)).Duration();
-        if (skew > Options.AllowedClockSkew)
+        if (skew > opts.AllowedClockSkew)
             return AuthenticateResult.Fail("Timestamp outside allowed window.");
 
-        var nonce = nonceValues.ToString();
-        if (!await _nonceStore.TryConsumeAsync(nonce, Options.AllowedClockSkew, request.HttpContext.RequestAborted))
+        var secret = await secretProvider.GetSecretAsync(keyId, request.HttpContext.RequestAborted);
+        if (secret is null)
+            return AuthenticateResult.Fail("Unknown key id.");
+
+        if (!await nonceStore.TryConsumeAsync(nonce, opts.AllowedClockSkew, request.HttpContext.RequestAborted))
             return AuthenticateResult.Fail("Replayed request.");
 
         request.EnableBuffering();
@@ -458,195 +799,43 @@ public sealed class HmacAuthenticationHandler : AuthenticationHandler<HmacAuthSc
             request.Body.Position = 0;
         }
 
-        var canonical = SignatureUtil.BuildCanonicalString(
-            request.Method, request.Path.Value ?? "/", request.QueryString.Value,
-            timestamp, nonce, bodyBytes);
+        var context = new SignatureContext(request.Method, request.Path.Value ?? "/",
+            request.QueryString.Value, timestamp, nonce, bodyBytes, keyId);
 
-        var expected = SignatureUtil.Sign(secret, canonical);
+        var canonical = signatureService.BuildCanonicalString(context);
+        var expected = signatureService.Sign(secret, canonical);
 
-        if (!SignatureUtil.TimingSafeEquals(expected, providedSignature))
+        if (!signatureService.TimingSafeEquals(expected, providedSignature))
             return AuthenticateResult.Fail("Invalid signature.");
 
         var identity = new ClaimsIdentity(new[] { new Claim("keyid", keyId) }, Scheme.Name);
-        var principal = new ClaimsPrincipal(identity);
-        var ticket = new AuthenticationTicket(principal, Scheme.Name);
-
+        var ticket = new AuthenticationTicket(new ClaimsPrincipal(identity), Scheme.Name);
         return AuthenticateResult.Success(ticket);
     }
-}
-```
 
-Registration:
-
-```csharp
-builder.Services
-    .AddAuthentication("Hmac")
-    .AddScheme<HmacAuthSchemeOptions, HmacAuthenticationHandler>("Hmac", options =>
+    private static bool TryHeader(HttpRequest request, string name, out string value)
     {
-        options.Secrets = new()
+        if (request.Headers.TryGetValue(name, out var values) && values.Count > 0 && !string.IsNullOrWhiteSpace(values[0]))
         {
-            ["partner-a"] = builder.Configuration["Hmac:Secrets:partner-a"]!,
-            ["partner-b"] = builder.Configuration["Hmac:Secrets:partner-b"]!,
-        };
-        options.AllowedClockSkew = TimeSpan.FromMinutes(5);
-    });
-
-builder.Services.AddAuthorization();
-```
-
-Then simply:
-
-```csharp
-[Authorize(AuthenticationSchemes = "Hmac")]
-[HttpPost("orders")]
-public IActionResult CreateOrder(OrderDto dto) => Ok();
-```
-
----
-
-## 5. Outbound: Signing Requests with `HttpClient`
-
-Use a `DelegatingHandler` so every outgoing request through a named/typed client is automatically signed — no per-call boilerplate.
-
-```csharp
-// HmacSigningHandler.cs
-using Contoso.Security.Hmac;
-
-public sealed class HmacSigningHandler : DelegatingHandler
-{
-    private readonly string _keyId;
-    private readonly string _secret;
-
-    public HmacSigningHandler(string keyId, string secret)
-    {
-        _keyId = keyId;
-        _secret = secret;
-    }
-
-    protected override async Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request, CancellationToken cancellationToken)
-    {
-        var bodyBytes = request.Content is null
-            ? Array.Empty<byte>()
-            : await request.Content.ReadAsByteArrayAsync(cancellationToken);
-
-        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var nonce = Guid.NewGuid().ToString("N");
-
-        var canonical = SignatureUtil.BuildCanonicalString(
-            request.Method.Method,
-            request.RequestUri!.AbsolutePath,
-            request.RequestUri.Query,
-            timestamp,
-            nonce,
-            bodyBytes);
-
-        var signature = SignatureUtil.Sign(_secret, canonical);
-
-        request.Headers.Remove(SignatureUtil.Headers.Signature);
-        request.Headers.Remove(SignatureUtil.Headers.Timestamp);
-        request.Headers.Remove(SignatureUtil.Headers.Nonce);
-        request.Headers.Remove(SignatureUtil.Headers.KeyId);
-
-        request.Headers.Add(SignatureUtil.Headers.Signature, signature);
-        request.Headers.Add(SignatureUtil.Headers.Timestamp, timestamp.ToString());
-        request.Headers.Add(SignatureUtil.Headers.Nonce, nonce);
-        request.Headers.Add(SignatureUtil.Headers.KeyId, _keyId);
-
-        return await base.SendAsync(request, cancellationToken);
+            value = values[0]!;
+            return true;
+        }
+        value = string.Empty;
+        return false;
     }
 }
 ```
 
-### Registering a signed `HttpClient` (typed client + `IHttpClientFactory`)
-
-```csharp
-// Program.cs (excerpt)
-builder.Services.AddTransient(_ =>
-    new HmacSigningHandler(
-        keyId: builder.Configuration["Downstream:KeyId"]!,
-        secret: builder.Configuration["Downstream:Secret"]!));
-
-builder.Services
-    .AddHttpClient<DownstreamApiClient>(client =>
-    {
-        client.BaseAddress = new Uri(builder.Configuration["Downstream:BaseUrl"]!);
-    })
-    .AddHttpMessageHandler(() => new HmacSigningHandler(
-        builder.Configuration["Downstream:KeyId"]!,
-        builder.Configuration["Downstream:Secret"]!));
-```
-
-```csharp
-// DownstreamApiClient.cs
-public sealed class DownstreamApiClient
-{
-    private readonly HttpClient _http;
-    public DownstreamApiClient(HttpClient http) => _http = http;
-
-    public async Task<HttpResponseMessage> CreateOrderAsync(object payload, CancellationToken ct)
-    {
-        // No manual signing needed here — the DelegatingHandler does it.
-        return await _http.PostAsJsonAsync("/api/orders", payload, ct);
-    }
-}
-```
-
-> ⚠️ `HttpContent.ReadAsByteArrayAsync` buffers the whole body. For very large payloads (file uploads), consider signing a content hash computed during a pre-pass instead of buffering in the handler, or exclude large-body endpoints from full-body signing (sign headers + a declared `Content-Length`/`Content-SHA256` header instead).
-
 ---
 
-## 6. Replay Protection
+## 9. Api Layer — Controllers & Program.cs (DI Wiring)
 
-Signing alone does **not** stop replay attacks (an attacker capturing a valid request and resending it). Defense in depth:
-
-1. **Timestamp window** — reject requests outside `AllowedClockSkew` (typically 2–5 minutes).
-2. **Nonce store** — reject a nonce that's already been consumed within the window (see `INonceStore` above). TTL the nonce entry to match the clock-skew window so storage doesn't grow unbounded.
-3. **HTTPS only** — enforce `RequireHttps` / HSTS; signing does not replace transport security.
-4. **Bind the signature to the exact resource + method** — canonical string must include path, method, and body hash (already covered above) so a captured signature can't be replayed against a different endpoint.
-
----
-
-## 7. Full Working Example
-
-### `Program.cs`
-
-```csharp
-using Microsoft.Extensions.Caching.Memory;
-
-var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddMemoryCache();
-builder.Services.AddSingleton<INonceStore, InMemoryNonceStore>();
-
-builder.Services.Configure<HmacOptions>(options =>
-{
-    options.Secrets = new Dictionary<string, string>
-    {
-        ["partner-a"] = builder.Configuration["Hmac:Secrets:partner-a"] ?? "dev-secret-change-me"
-    };
-    options.AllowedClockSkew = TimeSpan.FromMinutes(5);
-});
-
-builder.Services.AddControllers();
-
-var app = builder.Build();
-
-app.UseHttpsRedirection();
-
-// Verify inbound signed requests before routing/model binding runs.
-app.UseHmacVerification();
-
-app.UseAuthorization();
-app.MapControllers();
-
-app.Run();
-```
-
-### `OrdersController.cs`
+### `Controllers/OrdersController.cs`
 
 ```csharp
 using Microsoft.AspNetCore.Mvc;
+
+namespace YourApp.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
@@ -655,13 +844,83 @@ public class OrdersController : ControllerBase
     [HttpPost]
     public IActionResult Create([FromBody] CreateOrderRequest request)
     {
-        // If we reach here, HmacVerificationMiddleware already confirmed
-        // authenticity + integrity + freshness of the request.
+        // HmacVerificationMiddleware already ran — authenticity, integrity, and
+        // freshness are guaranteed by the time we get here.
         return Ok(new { orderId = Guid.NewGuid(), request.CustomerId });
     }
 }
 
 public record CreateOrderRequest(string CustomerId, decimal Amount);
+```
+
+### `Program.cs` — Composition Root
+
+This is the **only** file allowed to reference `Application`, `Infrastructure`, and framework types all at once — that's what makes it a composition root.
+
+```csharp
+using Microsoft.Extensions.Caching.Memory;
+using YourApp.Api.Security;
+using YourApp.Application.Security.Interfaces;
+using YourApp.Application.Security.Options;
+using YourApp.Infrastructure.Http;
+using YourApp.Infrastructure.Security.Hmac;
+using YourApp.Infrastructure.Security.Nonce;
+using YourApp.Infrastructure.Security.Secrets;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// ---- Configuration binding (Application-owned POCO, bound in Api) ----
+builder.Services.Configure<SignatureOptions>(
+    builder.Configuration.GetSection(SignatureOptions.SectionName));
+
+// ---- Application contracts -> Infrastructure implementations ----
+builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<INonceStore, InMemoryNonceStore>();
+// For multi-instance deployments, swap to:
+// builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+//     ConnectionMultiplexer.Connect(builder.Configuration["Redis:ConnectionString"]!));
+// builder.Services.AddSingleton<INonceStore, DistributedNonceStore>();
+
+builder.Services.AddSingleton<ISignatureService, HmacSignatureService>();
+builder.Services.AddSingleton<ISecretProvider, ConfigurationSecretProvider>();
+// Swap for Key Vault in production:
+// builder.Services.AddSingleton<ISecretProvider, KeyVaultSecretProvider>();
+
+// ---- Outbound signed HttpClient (Infrastructure) ----
+builder.Services.AddTransient(sp => new HmacSigningHandler(
+    sp.GetRequiredService<ISignatureService>(),
+    keyId: builder.Configuration["Downstream:KeyId"]!,
+    secret: builder.Configuration["Downstream:Secret"]!));
+
+builder.Services
+    .AddHttpClient<DownstreamApiClient>(client =>
+    {
+        client.BaseAddress = new Uri(builder.Configuration["Downstream:BaseUrl"]!);
+    })
+    .AddHttpMessageHandler(sp => sp.GetRequiredService<HmacSigningHandler>());
+
+// ---- Inbound verification: choose ONE of middleware or auth-handler style ----
+builder.Services.AddControllers();
+
+// Option A: AuthenticationHandler style (integrates with [Authorize])
+// builder.Services
+//     .AddAuthentication("Hmac")
+//     .AddScheme<HmacAuthSchemeOptions, HmacAuthenticationHandler>("Hmac", _ => { });
+// builder.Services.AddAuthorization();
+
+var app = builder.Build();
+
+app.UseHttpsRedirection();
+
+// Option B: Middleware style (simpler, webhook-style single scheme)
+app.UseHmacVerification();
+
+// app.UseAuthentication(); // only if using Option A
+// app.UseAuthorization();
+
+app.MapControllers();
+
+app.Run();
 ```
 
 ### `appsettings.json`
@@ -671,7 +930,8 @@ public record CreateOrderRequest(string CustomerId, decimal Amount);
   "Hmac": {
     "Secrets": {
       "partner-a": "replace-with-a-strong-random-secret-32-bytes-min"
-    }
+    },
+    "AllowedClockSkew": "00:05:00"
   },
   "Downstream": {
     "BaseUrl": "https://downstream.example.com",
@@ -681,92 +941,117 @@ public record CreateOrderRequest(string CustomerId, decimal Amount);
 }
 ```
 
-> In production, load secrets from a vault (Azure Key Vault, AWS Secrets Manager, HashiCorp Vault) — never commit them to `appsettings.json`.
+> Bind `SignatureOptions.AllowedClockSkew` as a `TimeSpan` string (`"00:05:00"`) — `IConfiguration` supports this natively.
 
 ---
 
-## 8. Testing with curl
+## 10. Testing Strategy by Layer
 
-Since curl can't compute HMAC natively for arbitrary canonical strings, script it:
+| Project | What it tests | Depends on ASP.NET Core? |
+|---|---|---|
+| `YourApp.Application.Tests` | `SignatureContext` construction rules, exception semantics | No |
+| `YourApp.Infrastructure.Tests` | `HmacSignatureService` canonical string + signature correctness, round-trip verify, tampered-body detection, `InMemoryNonceStore`/`DistributedNonceStore` replay behavior | No (pure BCL + Redis test container if needed) |
+| `YourApp.Api.Tests` | Full pipeline via `WebApplicationFactory<Program>` — send a signed request, assert 200; send tampered/replayed/stale request, assert 401 | Yes |
 
-```bash
-#!/usr/bin/env bash
-SECRET="replace-with-a-strong-random-secret-32-bytes-min"
-KEYID="partner-a"
-METHOD="POST"
-PATH_="/api/orders"
-QUERY=""
-BODY='{"customerId":"123","amount":49.99}'
-TS=$(date +%s)
-NONCE=$(uuidgen)
-
-BODY_HASH=$(printf '%s' "$BODY" | openssl dgst -sha256 -hex | awk '{print $2}')
-
-CANONICAL=$(printf '%s\n%s\n%s\n%s\n%s\n%s' "$METHOD" "$PATH_" "$QUERY" "$TS" "$NONCE" "$BODY_HASH")
-
-SIGNATURE=$(printf '%s' "$CANONICAL" | openssl dgst -sha256 -hmac "$SECRET" -binary | base64)
-
-curl -X POST "https://localhost:5001${PATH_}" \
-  -H "Content-Type: application/json" \
-  -H "X-Signature: ${SIGNATURE}" \
-  -H "X-Signature-Timestamp: ${TS}" \
-  -H "X-Signature-Nonce: ${NONCE}" \
-  -H "X-Signature-KeyId: ${KEYID}" \
-  -d "$BODY"
-```
-
-### Unit test for the utility (xUnit)
+### `YourApp.Infrastructure.Tests/Security/HmacSignatureServiceTests.cs`
 
 ```csharp
-using Contoso.Security.Hmac;
+using YourApp.Application.Security.Models;
+using YourApp.Infrastructure.Security.Hmac;
 using Xunit;
 
-public class SignatureUtilTests
+public class HmacSignatureServiceTests
 {
+    private readonly HmacSignatureService _sut = new();
+
     [Fact]
     public void Sign_And_Verify_RoundTrip_Succeeds()
     {
         const string secret = "test-secret";
         var body = System.Text.Encoding.UTF8.GetBytes("""{"a":1}""");
-        var ts = 1726387200L;
-        var nonce = "fixed-nonce-for-test";
+        var context = new SignatureContext("POST", "/api/orders", "b=2&a=1", 1726387200, "fixed-nonce", body, "partner-a");
 
-        var canonical = SignatureUtil.BuildCanonicalString("POST", "/api/orders", "b=2&a=1", ts, nonce, body);
-        var sig = SignatureUtil.Sign(secret, canonical);
+        var canonical = _sut.BuildCanonicalString(context);
+        var signature = _sut.Sign(secret, canonical);
 
-        var canonicalAgain = SignatureUtil.BuildCanonicalString("POST", "/api/orders", "a=1&b=2", ts, nonce, body);
-        var expected = SignatureUtil.Sign(secret, canonicalAgain);
+        // Rebuild with query params in a different original order — normalization must match.
+        var context2 = context with { RawQueryString = "a=1&b=2" };
+        var canonical2 = _sut.BuildCanonicalString(context2);
+        var expected = _sut.Sign(secret, canonical2);
 
-        Assert.True(SignatureUtil.TimingSafeEquals(sig, expected));
+        Assert.True(_sut.TimingSafeEquals(signature, expected));
     }
 
     [Fact]
     public void TamperedBody_ProducesDifferentSignature()
     {
         const string secret = "test-secret";
-        var original = SignatureUtil.BuildCanonicalString("POST", "/api/orders", "", 1L, "n1",
-            System.Text.Encoding.UTF8.GetBytes("""{"amount":10}"""));
-        var tampered = SignatureUtil.BuildCanonicalString("POST", "/api/orders", "", 1L, "n1",
-            System.Text.Encoding.UTF8.GetBytes("""{"amount":10000}"""));
+        var original = new SignatureContext("POST", "/api/orders", "", 1, "n1",
+            System.Text.Encoding.UTF8.GetBytes("""{"amount":10}"""), "partner-a");
+        var tampered = original with
+        {
+            BodyBytes = System.Text.Encoding.UTF8.GetBytes("""{"amount":10000}""")
+        };
 
-        Assert.False(SignatureUtil.TimingSafeEquals(
-            SignatureUtil.Sign(secret, original),
-            SignatureUtil.Sign(secret, tampered)));
+        var sigOriginal = _sut.Sign(secret, _sut.BuildCanonicalString(original));
+        var sigTampered = _sut.Sign(secret, _sut.BuildCanonicalString(tampered));
+
+        Assert.False(_sut.TimingSafeEquals(sigOriginal, sigTampered));
     }
+}
+```
+
+### `YourApp.Api.Tests/Security/HmacVerificationMiddlewareTests.cs` (sketch)
+
+```csharp
+public class HmacVerificationMiddlewareTests : IClassFixture<WebApplicationFactory<Program>>
+{
+    private readonly WebApplicationFactory<Program> _factory;
+    public HmacVerificationMiddlewareTests(WebApplicationFactory<Program> factory) => _factory = factory;
+
+    [Fact]
+    public async Task ValidSignature_Returns200()
+    {
+        var client = _factory.CreateClient();
+        var request = BuildSignedRequest("POST", "/api/orders", """{"customerId":"123","amount":49.99}""");
+
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task TamperedBody_Returns401()
+    {
+        var client = _factory.CreateClient();
+        var request = BuildSignedRequest("POST", "/api/orders", """{"customerId":"123","amount":49.99}""");
+        request.Content = new StringContent("""{"customerId":"123","amount":999999}""",
+            System.Text.Encoding.UTF8, "application/json"); // swap body after signing
+
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    // BuildSignedRequest helper would use the same HmacSignatureService to construct
+    // a correctly-signed HttpRequestMessage — reuse Infrastructure directly in tests.
 }
 ```
 
 ---
 
-## 9. Security Checklist
+## 11. Security Checklist
 
-- [ ] Secrets are ≥256 bits of entropy, stored in a vault/secret manager, never in source control.
+- [ ] `Application` project has no reference to `Microsoft.AspNetCore.*` or crypto libraries — only contracts and POCOs.
+- [ ] `Infrastructure` is the sole owner of `System.Security.Cryptography` usage for this feature.
+- [ ] `Api` never builds a canonical string or calls `HMACSHA256` directly — it only calls `ISignatureService`.
 - [ ] Comparison uses `CryptographicOperations.FixedTimeEquals`, never `==`/`Equals`.
 - [ ] Canonical string includes method, path, query, timestamp, nonce, and body hash.
-- [ ] Timestamp window enforced (reject stale/future requests).
-- [ ] Nonce store enforced and backed by a distributed cache (Redis) in multi-instance deployments.
-- [ ] HTTPS enforced end-to-end; HSTS enabled.
-- [ ] Key rotation supported via a `KeyId` header mapped to multiple active secrets.
-- [ ] Logging on verification failure excludes the secret and full signature (log keyId + reason only).
-- [ ] Body is read via buffering (`EnableBuffering`) so verification doesn't break model binding.
-- [ ] Large payloads have a documented strategy (stream hashing or excluded from full-body signing) rather than being fully buffered in memory.
+- [ ] Timestamp window enforced via `SignatureOptions.AllowedClockSkew`.
+- [ ] `INonceStore` backed by Redis (`DistributedNonceStore`) in multi-instance deployments — `InMemoryNonceStore` is single-instance only.
+- [ ] Secrets resolved via `ISecretProvider`, backed by a vault in production — never committed to `appsettings.json`.
+- [ ] HTTPS enforced end-to-end; HSTS enabled in `Program.cs`.
+- [ ] Key rotation supported via `KeyId` header mapped to multiple active secrets in `SignatureOptions.Secrets`.
+- [ ] Logging on verification failure (in `HmacVerificationMiddleware`) excludes the secret and full signature — logs `SignatureFailureReason`/exception message and path only.
+- [ ] Body buffered via `EnableBuffering()` in the Api-layer middleware only — Infrastructure services never touch `HttpContext`.
+- [ ] Swapping `ISecretProvider` (config → Key Vault) or `ISignatureService` (software HMAC → HSM) requires touching only `Infrastructure` + one line in `Program.cs` — never `Application` or `Api` controller/middleware code.
