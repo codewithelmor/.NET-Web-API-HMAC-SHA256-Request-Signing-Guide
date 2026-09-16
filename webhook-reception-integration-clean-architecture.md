@@ -423,7 +423,104 @@ Reusing `SignatureOptions.Secrets`/`ConfigurationSecretProvider` for webhook sec
 
 ---
 
-## 8. Checklist to add to your existing §11
+## 8. Worked Example — A Single Stripe Delivery, End to End
+
+This walks through one real `payment_intent.succeeded` delivery so the moving parts in §4/§5 above have something concrete to anchor to.
+
+### 8.1 The secret
+
+When you connect a webhook endpoint in the Stripe dashboard (or via API), Stripe issues a **signing secret**:
+
+```
+whsec_5f4a1b8c9d2e3f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a
+```
+
+Stored under the `webhook:stripe` KeyId namespace introduced in §5:
+
+```json
+"Hmac": {
+  "Secrets": {
+    "webhook:stripe": "whsec_5f4a1b8c9d2e3f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a"
+  }
+}
+```
+
+### 8.2 What Stripe actually sends
+
+**Headers:**
+```
+Content-Type: application/json
+Stripe-Signature: t=1758012345,v1=8a3f2e1c9b7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f
+```
+
+**Raw body** (the exact byte sequence matters — never a re-serialized version):
+```json
+{"id":"evt_1PxJ8k2eZvKYlo2C9x8QW1zA","object":"event","type":"payment_intent.succeeded","created":1758012345,"data":{"object":{"id":"pi_3PxJ8k2eZvKYlo2C0xYzAbCd","amount":2000,"currency":"usd","status":"succeeded"}}}
+```
+
+### 8.3 How `Stripe-Signature` is constructed (what the verifier reverses)
+
+| Part | Value | Meaning |
+|---|---|---|
+| `t=1758012345` | Unix timestamp | When Stripe signed this |
+| `v1=8a3f2e1c...` | Hex HMAC-SHA256 | The signature |
+
+Stripe computes the signature over a **signed_payload string** — timestamp and raw body joined with a dot, not just the raw body alone:
+
+```
+signed_payload = "{timestamp}.{raw_body}"
+                = "1758012345.{\"id\":\"evt_1PxJ8k2eZvKYlo2C9x8QW1zA\",...}"
+
+v1 = HMAC-SHA256(secret, signed_payload)   // hex-encoded
+```
+
+This is exactly what `StripeWebhookVerifier.IsValid` (§4) reconstructs:
+
+```csharp
+var signedPayload = $"{tRaw}.{rawBody}";
+var computed = Convert.ToHexStringLower(
+    HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), Encoding.UTF8.GetBytes(signedPayload)));
+```
+
+If `computed == providedSig` (compared via `CryptographicOperations.FixedTimeEquals`) the request genuinely came from Stripe and the body wasn't altered in transit.
+
+### 8.4 Manually reproducing the signature (sanity check / local testing)
+
+Useful for confirming your verifier is doing what you think, or for crafting a signed test request by hand:
+
+```bash
+BODY='{"id":"evt_1PxJ8k2eZvKYlo2C9x8QW1zA","object":"event","type":"payment_intent.succeeded","created":1758012345,"data":{"object":{"id":"pi_3PxJ8k2eZvKYlo2C0xYzAbCd","amount":2000,"currency":"usd","status":"succeeded"}}}'
+TS=1758012345
+SECRET="whsec_5f4a1b8c9d2e3f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a"
+
+echo -n "${TS}.${BODY}" | openssl dgst -sha256 -hmac "$SECRET"
+```
+
+Whatever hex string prints is what should appear after `v1=` for that exact body + timestamp + secret combination. Change a single character in `$BODY` and the output changes completely — that's the tamper-detection property your verifier is checking for.
+
+### 8.5 What happens once verification passes
+
+1. `eventId` is extracted from the JSON body's `id` field (per `WebhooksController.ExtractEventId`, §5) → `evt_1PxJ8k2eZvKYlo2C9x8QW1zA`.
+2. `WebhookEventStore.TryRecordAsync("stripe", "evt_1PxJ8k2eZvKYlo2C9x8QW1zA", rawBody)` inserts a row. If Stripe retries this same event (timeout, network blip on their side), the second insert violates the unique `(ProviderKey, EventId)` index, `TryRecordAsync` returns `false`, and nothing is double-processed.
+3. The controller returns `200 OK` either way — new or duplicate.
+4. If it was new, `queue.Enqueue("stripe", eventId)` — `WebhookProcessingWorker` later dequeues it and hands it to whichever `IWebhookProcessor` has `ProviderKey == "stripe"` for the actual business logic (e.g., marking an order paid).
+
+### 8.6 Where the real secret comes from in practice
+
+You won't type `whsec_...` by hand in production — Stripe shows it once when you create the endpoint (Dashboard → Developers → Webhooks → your endpoint → "Reveal signing secret"), or it comes back from the API when creating a `WebhookEndpoint` object.
+
+For **local development**, the Stripe CLI generates a temporary secret scoped to that session:
+
+```bash
+stripe listen --forward-to localhost:5001/webhooks/stripe
+# prints: Ready! Your webhook signing secret is whsec_... (^C to quit)
+```
+
+Drop that value into `appsettings.Development.json` or user-secrets for the duration of local testing — it's different from (and shouldn't be confused with) the production endpoint's secret.
+
+---
+
+## 9. Checklist to add to your existing §11
 
 - [ ] `/webhooks/*` is excluded from `HmacVerificationMiddleware` via `MapWhen` (or an explicit path check) — verified by a test that a request with *no* internal-scheme headers still reaches the webhook controller.
 - [ ] Each `IWebhookSignatureVerifier` reads the **raw buffered body**, never a re-serialized/model-bound version.
